@@ -1,6 +1,12 @@
 """
-Reno Ecosystem Telegram Bot
-Search for startup resources directly from Telegram.
+Reno Ecosystem Telegram Bot with Claude AI
+Natural conversation-powered search for startup resources.
+
+Features:
+- Claude AI for intelligent, conversational responses
+- Semantic search of resource database
+- Context-aware follow-up questions
+- Personalized recommendations
 
 Setup:
 1. Create bot with @BotFather on Telegram
@@ -9,16 +15,18 @@ Setup:
 4. Deploy to Railway/Render/etc.
 
 Usage:
-    pip install python-telegram-bot supabase openai python-dotenv
+    pip install python-telegram-bot anthropic supabase openai python-dotenv
     python telegram_bot.py
 """
 
 import os
 import logging
+import json
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from supabase import create_client
 from openai import OpenAI
+from anthropic import Anthropic
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -31,14 +39,19 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 # Optional: Restrict to specific users/groups
-ALLOWED_USER_IDS = os.getenv("ALLOWED_USER_IDS", "").split(",")  # Comma-separated user IDs
+ALLOWED_USER_IDS = os.getenv("ALLOWED_USER_IDS", "").split(",")
 ALLOWED_USER_IDS = [int(uid.strip()) for uid in ALLOWED_USER_IDS if uid.strip()]
 
 # Initialize clients
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
+anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
+
+# Conversation history storage (in production, use Redis or database)
+conversation_history = {}
 
 # Logging
 logging.basicConfig(
@@ -46,6 +59,60 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# ============================================================================
+# SYSTEM PROMPT FOR CLAUDE
+# ============================================================================
+
+SYSTEM_PROMPT = """You are the Reno Startup Ecosystem Navigator, a helpful assistant that connects founders with the right resources in the Reno-Tahoe region.
+
+You have access to a database of startup resources including mentorship programs, funding opportunities, accelerators, workspaces, and government resources.
+
+## YOUR PERSONALITY
+- Friendly, encouraging, and supportive
+- Concise (this is Telegram - keep responses brief!)
+- Practical and action-oriented
+- Knowledgeable about the startup journey
+
+## HOW TO RESPOND
+
+1. **When search results are provided:**
+   - Explain WHY each resource is relevant to their specific situation
+   - Highlight the most important 2-3 resources
+   - Include key details: cost (free/paid), what they offer
+   - Suggest how to reach out if intro_script is available
+   - Ask a follow-up question to help narrow down or expand the search
+
+2. **When NO search results are provided:**
+   - Ask clarifying questions to understand their needs
+   - Try to understand: their stage, what help they need, any relevant background
+
+3. **For follow-up questions:**
+   - Remember context from the conversation
+   - Offer to search for different resources if needed
+   - Provide practical next steps
+
+## FORMATTING FOR TELEGRAM
+- Use *bold* for resource names and key points
+- Use _italics_ for categories or emphasis
+- Keep paragraphs short (2-3 sentences max)
+- Use emojis sparingly but effectively: 🚀 💡 ✅ 🔗 💰 🆓
+- Don't use markdown headers (##) - they don't render in Telegram
+
+## EXAMPLE RESPONSE STYLE
+
+"Based on what you shared, here are my top picks:
+
+*1. Nevada SBDC* 🆓
+Perfect for early-stage founders who need help with business planning. They offer free one-on-one advising.
+
+*2. StartUpNV* 
+If you're building a scalable tech company, their accelerator could be a great fit.
+
+When reaching out to SBDC, try: _"I'm starting a business and would like help creating a business plan."_
+
+Would you like more details on either of these, or should I look for something more specific like funding or workspace?"
+"""
 
 # ============================================================================
 # SEARCH FUNCTIONS
@@ -79,44 +146,141 @@ def get_resource_details(resource_id: int) -> dict:
     ).eq("id", resource_id).single().execute()
     return result.data
 
-def format_resource_short(r: dict, index: int) -> str:
-    """Format a resource for the search results list."""
-    cost_emoji = {"Free": "🆓", "Paid": "💰", "Varies": "💲"}.get(r.get("cost"), "")
-    score = int(r.get("similarity", 0) * 100)
+def get_resource_tags(resource_id: int) -> dict:
+    """Get service and audience tags for a resource."""
+    services = supabase.table("resource_services").select(
+        "service_tags(name)"
+    ).eq("resource_id", resource_id).execute()
     
-    return f"""*{index}. {r['name']}* {cost_emoji}
-_{r.get('category', 'Resource')}_ • Match: {score}%
-{r.get('description', '')[:150]}{'...' if len(r.get('description', '')) > 150 else ''}
+    audiences = supabase.table("resource_audiences").select(
+        "audience_tags(name)"
+    ).eq("resource_id", resource_id).execute()
+    
+    return {
+        "services": [s["service_tags"]["name"] for s in services.data if s.get("service_tags")],
+        "audiences": [a["audience_tags"]["name"] for a in audiences.data if a.get("audience_tags")]
+    }
+
+def format_resources_for_claude(resources: list[dict]) -> str:
+    """Format search results for Claude to understand."""
+    if not resources:
+        return "NO RESULTS FOUND"
+    
+    formatted = []
+    for r in resources:
+        tags = get_resource_tags(r["id"])
+        
+        resource_text = f"""
+RESOURCE: {r['name']}
+- ID: {r['id']}
+- Category: {r.get('category', 'N/A')}
+- Stage: {r.get('stage', 'N/A')}
+- Cost: {r.get('cost', 'N/A')}
+- Geography: {r.get('geography', 'N/A')}
+- Description: {r.get('description', 'N/A')}
+- Best For: {r.get('best_for', 'N/A')}
+- Not Good For: {r.get('not_good_for', 'N/A')}
+- Intro Script: {r.get('intro_script', 'N/A')}
+- Website: {r.get('website', 'N/A')}
+- Wait Time: {r.get('wait_time', 'N/A')}
+- Service Tags: {', '.join(tags['services']) if tags['services'] else 'N/A'}
+- Audience Tags: {', '.join(tags['audiences']) if tags['audiences'] else 'N/A'}
+- Relevance Score: {int(r.get('similarity', 0) * 100)}%
 """
+        formatted.append(resource_text)
+    
+    return "\n---\n".join(formatted)
 
-def format_resource_full(r: dict) -> str:
-    """Format a resource with full details."""
-    cost_emoji = {"Free": "🆓", "Paid": "💰", "Varies": "💲"}.get(r.get("cost_levels", {}).get("name") if r.get("cost_levels") else None, "")
-    
-    text = f"""📍 *{r['name']}* {cost_emoji}
+# ============================================================================
+# CLAUDE CONVERSATION
+# ============================================================================
 
-📂 *Category:* {r.get('categories', {}).get('name', 'N/A') if r.get('categories') else 'N/A'}
-🎯 *Stage:* {r.get('stages', {}).get('name', 'N/A') if r.get('stages') else 'N/A'}
-💵 *Cost:* {r.get('cost_levels', {}).get('name', 'N/A') if r.get('cost_levels') else 'N/A'}
-📍 *Geography:* {r.get('geographies', {}).get('name', 'N/A') if r.get('geographies') else 'N/A'}
+def get_conversation_history(user_id: int) -> list[dict]:
+    """Get conversation history for a user."""
+    if user_id not in conversation_history:
+        conversation_history[user_id] = []
+    return conversation_history[user_id]
 
-📝 *Description:*
-{r.get('description', 'No description available.')}
-"""
+def add_to_history(user_id: int, role: str, content: str):
+    """Add message to conversation history."""
+    history = get_conversation_history(user_id)
+    history.append({"role": role, "content": content})
+    
+    # Keep only last 10 messages to manage context length
+    if len(history) > 10:
+        conversation_history[user_id] = history[-10:]
 
-    if r.get('best_for'):
-        text += f"\n✅ *Best For:*\n{r['best_for']}\n"
+def clear_history(user_id: int):
+    """Clear conversation history for a user."""
+    conversation_history[user_id] = []
+
+def should_search(message: str, history: list[dict]) -> tuple[bool, str]:
+    """Use Claude to determine if we should search and what query to use."""
     
-    if r.get('intro_script'):
-        text += f"\n💬 *How to Reach Out:*\n_{r['intro_script']}_\n"
+    # Quick heuristics first
+    search_indicators = [
+        "looking for", "need help", "find", "search", "recommend",
+        "resources", "funding", "mentor", "accelerator", "workspace",
+        "starting", "business", "startup", "entrepreneur", "founder",
+        "veteran", "student", "woman", "grant", "investor"
+    ]
     
-    if r.get('website'):
-        text += f"\n🔗 *Website:* {r['website']}\n"
+    message_lower = message.lower()
     
-    if r.get('wait_time'):
-        text += f"\n⏱️ *Wait Time:* {r['wait_time']}\n"
+    # If it's clearly a search request
+    if any(indicator in message_lower for indicator in search_indicators):
+        return True, message
     
-    return text
+    # If it's a short follow-up like "yes", "tell me more", etc.
+    short_responses = ["yes", "yeah", "sure", "ok", "okay", "tell me more", "more", "details"]
+    if message_lower.strip() in short_responses:
+        return False, ""
+    
+    # For ambiguous cases, let Claude decide
+    return True, message
+
+async def get_claude_response(user_id: int, user_message: str, search_results: str = None) -> str:
+    """Get response from Claude with optional search results."""
+    
+    history = get_conversation_history(user_id)
+    
+    # Build the user message with search context if available
+    if search_results and search_results != "NO RESULTS FOUND":
+        augmented_message = f"""USER MESSAGE: {user_message}
+
+SEARCH RESULTS FROM DATABASE:
+{search_results}
+
+Please analyze these results and provide a helpful, personalized response. Explain why these resources are relevant to their situation."""
+    elif search_results == "NO RESULTS FOUND":
+        augmented_message = f"""USER MESSAGE: {user_message}
+
+No resources were found matching this query. Please ask clarifying questions to better understand what they need, or suggest they try different search terms."""
+    else:
+        augmented_message = user_message
+    
+    # Add user message to history
+    messages = history + [{"role": "user", "content": augmented_message}]
+    
+    try:
+        response = anthropic_client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1024,
+            system=SYSTEM_PROMPT,
+            messages=messages
+        )
+        
+        assistant_message = response.content[0].text
+        
+        # Store the original user message (not the augmented one) in history
+        add_to_history(user_id, "user", user_message)
+        add_to_history(user_id, "assistant", assistant_message)
+        
+        return assistant_message
+        
+    except Exception as e:
+        logger.error(f"Claude API error: {e}")
+        return "I'm having trouble connecting right now. Please try again in a moment."
 
 # ============================================================================
 # ACCESS CONTROL
@@ -124,7 +288,7 @@ def format_resource_full(r: dict) -> str:
 
 def is_authorized(user_id: int) -> bool:
     """Check if user is authorized to use the bot."""
-    if not ALLOWED_USER_IDS:  # If no restrictions set, allow everyone
+    if not ALLOWED_USER_IDS:
         return True
     return user_id in ALLOWED_USER_IDS
 
@@ -140,27 +304,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("⛔ Sorry, you're not authorized to use this bot.")
         return
     
+    # Clear conversation history for fresh start
+    clear_history(user.id)
+    
     welcome_text = f"""👋 Hi {user.first_name}! I'm the *Reno Startup Ecosystem Navigator*.
 
-I can help you find resources for founders and entrepreneurs in the Reno-Tahoe region.
+I can help you find the right resources for your entrepreneurial journey in the Reno-Tahoe region.
 
-*How to use me:*
-• Just type what you're looking for
-• Be specific about your situation
+Just tell me about yourself and what you're looking for. For example:
 
-*Example searches:*
-• "veteran starting a business"
-• "free mentorship for early stage startups"
-• "funding for tech companies"
-• "workspace in Reno"
+• _"I'm a veteran looking to start a small business"_
+• _"I need funding for my tech startup"_
+• _"Where can I find free mentorship?"_
 
-*Commands:*
-/search <query> - Search for resources
-/categories - List all categories
-/help - Show this message
+What can I help you with today? 🚀"""
 
-Just type your question and I'll find the best matches! 🚀
-"""
     await update.message.reply_text(welcome_text, parse_mode='Markdown')
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -169,103 +327,103 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("⛔ Sorry, you're not authorized to use this bot.")
         return
     
-    await start(update, context)
+    help_text = """*How to use this bot:*
 
-async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List all categories."""
+Just chat naturally! Tell me:
+• What stage you're at (idea, early, growing)
+• What kind of help you need
+• Any relevant background (veteran, student, etc.)
+
+*Commands:*
+/start - Start fresh conversation
+/clear - Clear conversation history
+/help - Show this message
+
+*Tips:*
+• Be specific about what you need
+• Ask follow-up questions
+• I remember our conversation context!"""
+
+    await update.message.reply_text(help_text, parse_mode='Markdown')
+
+async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Clear conversation history."""
     if not is_authorized(update.effective_user.id):
         await update.message.reply_text("⛔ Sorry, you're not authorized to use this bot.")
         return
     
-    result = supabase.table("categories").select("name").order("display_order").execute()
-    categories = [c["name"] for c in result.data]
-    
-    text = "*📂 Resource Categories:*\n\n"
-    for cat in categories:
-        text += f"• {cat}\n"
-    
-    text += "\n_Search any category by typing it!_"
-    await update.message.reply_text(text, parse_mode='Markdown')
-
-async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /search command."""
-    if not is_authorized(update.effective_user.id):
-        await update.message.reply_text("⛔ Sorry, you're not authorized to use this bot.")
-        return
-    
-    if not context.args:
-        await update.message.reply_text("Please provide a search query.\n\nExample: `/search veteran business help`", parse_mode='Markdown')
-        return
-    
-    query = " ".join(context.args)
-    await perform_search(update, query)
+    clear_history(update.effective_user.id)
+    await update.message.reply_text("🔄 Conversation cleared! What would you like to explore?")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle regular text messages as search queries."""
-    if not is_authorized(update.effective_user.id):
+    """Handle regular text messages with Claude AI."""
+    user = update.effective_user
+    
+    if not is_authorized(user.id):
         await update.message.reply_text("⛔ Sorry, you're not authorized to use this bot.")
         return
     
-    query = update.message.text
-    await perform_search(update, query)
-
-async def perform_search(update: Update, query: str) -> None:
-    """Perform search and send results."""
-    # Send "searching" message
-    searching_msg = await update.message.reply_text("🔍 Searching...")
+    user_message = update.message.text
+    
+    # Show typing indicator
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     
     try:
-        # Search
-        results = search_resources(query, limit=5)
+        # Determine if we should search
+        should_do_search, search_query = should_search(user_message, get_conversation_history(user.id))
         
-        if not results:
-            await searching_msg.edit_text(
-                f"😕 No resources found for: *{query}*\n\nTry a different search term.",
-                parse_mode='Markdown'
-            )
-            return
+        search_results = None
+        resource_buttons = []
         
-        # Format results
-        text = f"🔍 *Results for:* _{query}_\n\n"
-        
-        # Create inline keyboard for "More Details" buttons
-        keyboard = []
-        
-        for i, r in enumerate(results, 1):
-            text += format_resource_short(r, i)
-            text += "\n"
+        if should_do_search:
+            # Search the database
+            results = search_resources(search_query, limit=5)
             
-            # Add button for each result
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"📋 Details: {r['name'][:30]}...",
-                    callback_data=f"details_{r['id']}"
-                )
-            ])
+            if results:
+                search_results = format_resources_for_claude(results)
+                
+                # Create buttons for top results
+                for r in results[:3]:  # Top 3 as buttons
+                    resource_buttons.append([
+                        InlineKeyboardButton(
+                            f"📋 {r['name'][:35]}{'...' if len(r['name']) > 35 else ''}",
+                            callback_data=f"details_{r['id']}"
+                        )
+                    ])
+            else:
+                search_results = "NO RESULTS FOUND"
         
-        reply_markup = InlineKeyboardMarkup(keyboard)
+        # Get Claude's response
+        response = await get_claude_response(user.id, user_message, search_results)
         
-        await searching_msg.edit_text(
-            text,
-            parse_mode='Markdown',
-            reply_markup=reply_markup,
-            disable_web_page_preview=True
-        )
-        
+        # Send response with optional resource buttons
+        if resource_buttons:
+            reply_markup = InlineKeyboardMarkup(resource_buttons)
+            await update.message.reply_text(
+                response,
+                parse_mode='Markdown',
+                reply_markup=reply_markup,
+                disable_web_page_preview=True
+            )
+        else:
+            await update.message.reply_text(
+                response,
+                parse_mode='Markdown',
+                disable_web_page_preview=True
+            )
+            
     except Exception as e:
-        logger.error(f"Search error: {e}")
-        await searching_msg.edit_text(
-            "❌ Sorry, an error occurred. Please try again.",
-            parse_mode='Markdown'
+        logger.error(f"Message handling error: {e}")
+        await update.message.reply_text(
+            "Sorry, I encountered an error. Please try again or use /start to restart."
         )
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle inline button callbacks."""
+    """Handle inline button callbacks for resource details."""
     query = update.callback_query
     await query.answer()
     
     if not is_authorized(query.from_user.id):
-        await query.edit_message_text("⛔ Sorry, you're not authorized to use this bot.")
         return
     
     data = query.data
@@ -277,38 +435,44 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             resource = get_resource_details(resource_id)
             
             if resource:
-                text = format_resource_full(resource)
+                # Format detailed view
+                cost = resource.get('cost_levels', {}).get('name', 'N/A') if resource.get('cost_levels') else 'N/A'
+                cost_emoji = {"Free": "🆓", "Paid": "💰", "Varies": "💲"}.get(cost, "")
                 
-                # Add "Back to search" button
-                keyboard = [[
-                    InlineKeyboardButton("🔙 New Search", callback_data="new_search")
-                ]]
+                text = f"""📍 *{resource['name']}* {cost_emoji}
+
+*Category:* {resource.get('categories', {}).get('name', 'N/A') if resource.get('categories') else 'N/A'}
+*Stage:* {resource.get('stages', {}).get('name', 'N/A') if resource.get('stages') else 'N/A'}
+*Cost:* {cost}
+
+{resource.get('description', 'No description available.')}
+"""
+
+                if resource.get('best_for'):
+                    text += f"\n✅ *Best For:*\n{resource['best_for']}\n"
                 
+                if resource.get('intro_script'):
+                    text += f"\n💬 *How to reach out:*\n_{resource['intro_script']}_\n"
+                
+                # Buttons
+                keyboard = []
                 if resource.get('website'):
-                    keyboard[0].insert(0, 
-                        InlineKeyboardButton("🌐 Website", url=resource['website'])
-                    )
+                    keyboard.append([InlineKeyboardButton("🌐 Visit Website", url=resource['website'])])
                 
-                reply_markup = InlineKeyboardMarkup(keyboard)
+                reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
                 
-                await query.edit_message_text(
+                await query.message.reply_text(
                     text,
                     parse_mode='Markdown',
                     reply_markup=reply_markup,
                     disable_web_page_preview=True
                 )
             else:
-                await query.edit_message_text("❌ Resource not found.")
+                await query.message.reply_text("❌ Resource not found.")
                 
         except Exception as e:
             logger.error(f"Details error: {e}")
-            await query.edit_message_text("❌ Error loading details.")
-    
-    elif data == "new_search":
-        await query.edit_message_text(
-            "🔍 *Ready for a new search!*\n\nJust type what you're looking for.",
-            parse_mode='Markdown'
-        )
+            await query.message.reply_text("❌ Error loading details.")
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Log errors."""
@@ -320,19 +484,22 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 def main() -> None:
     """Start the bot."""
+    # Validate configuration
+    missing = []
     if not TELEGRAM_BOT_TOKEN:
-        print("ERROR: TELEGRAM_BOT_TOKEN not set")
-        return
-    
+        missing.append("TELEGRAM_BOT_TOKEN")
     if not SUPABASE_URL or not SUPABASE_KEY:
-        print("ERROR: SUPABASE credentials not set")
-        return
-    
+        missing.append("SUPABASE_URL/SUPABASE_KEY")
     if not OPENAI_API_KEY:
-        print("ERROR: OPENAI_API_KEY not set")
+        missing.append("OPENAI_API_KEY")
+    if not ANTHROPIC_API_KEY:
+        missing.append("ANTHROPIC_API_KEY")
+    
+    if missing:
+        print(f"ERROR: Missing environment variables: {', '.join(missing)}")
         return
     
-    print("🤖 Starting Reno Ecosystem Telegram Bot...")
+    print("🤖 Starting Reno Ecosystem Telegram Bot (with Claude AI)...")
     
     # Create application
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
@@ -340,8 +507,7 @@ def main() -> None:
     # Add handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("categories", categories_command))
-    application.add_handler(CommandHandler("search", search_command))
+    application.add_handler(CommandHandler("clear", clear_command))
     application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
@@ -349,7 +515,7 @@ def main() -> None:
     application.add_error_handler(error_handler)
     
     # Start polling
-    print("✅ Bot is running! Press Ctrl+C to stop.")
+    print("✅ Bot is running with Claude AI! Press Ctrl+C to stop.")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
