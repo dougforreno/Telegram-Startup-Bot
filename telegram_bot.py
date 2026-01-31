@@ -1,12 +1,14 @@
 """
-Reno Ecosystem Telegram Bot with Claude AI
+Reno Ecosystem Telegram Bot with Claude AI - Multi-Language
 Natural conversation-powered search for startup resources.
+Automatically responds in the user's language.
 
 Features:
 - Claude AI for intelligent, conversational responses
+- Automatic language detection and response
+- Supports English, Spanish, Chinese, Tagalog, and more
 - Semantic search of resource database
 - Context-aware follow-up questions
-- Personalized recommendations
 
 Setup:
 1. Create bot with @BotFather on Telegram
@@ -21,7 +23,6 @@ Usage:
 
 import os
 import logging
-import json
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from supabase import create_client
@@ -61,58 +62,153 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# SYSTEM PROMPT FOR CLAUDE
+# SUPPORTED LANGUAGES
+# ============================================================================
+
+SUPPORTED_LANGUAGES = {
+    "en": "English",
+    "es": "Spanish (Español)",
+    "zh": "Chinese (中文)",
+    "tl": "Tagalog (Filipino)",
+    "vi": "Vietnamese (Tiếng Việt)",
+    "ko": "Korean (한국어)",
+    "ja": "Japanese (日本語)",
+    "ar": "Arabic (العربية)",
+    "fr": "French (Français)",
+    "de": "German (Deutsch)",
+    "pt": "Portuguese (Português)",
+    "hi": "Hindi (हिन्दी)",
+    "ru": "Russian (Русский)",
+}
+
+# ============================================================================
+# SYSTEM PROMPT FOR CLAUDE (Multi-language)
 # ============================================================================
 
 SYSTEM_PROMPT = """You are the Reno Startup Ecosystem Navigator, a helpful assistant that connects founders with the right resources in the Reno-Tahoe region.
 
-You have access to a database of startup resources including mentorship programs, funding opportunities, accelerators, workspaces, and government resources.
+## CRITICAL: LANGUAGE HANDLING
+- ALWAYS detect the language of the user's message
+- ALWAYS respond in the SAME language the user writes in
+- If they write in Spanish, respond entirely in Spanish
+- If they write in Chinese, respond entirely in Chinese
+- If they mix languages, respond in their primary language
+- Resource names can stay in English (they're proper nouns), but your explanations must be in the user's language
+
+## LANGUAGE EXAMPLES
+
+English: "I need help starting a business"
+→ Respond in English
+
+Spanish: "Necesito ayuda para empezar un negocio"
+→ Respond entirely in Spanish: "¡Excelente! Aquí hay recursos que te pueden ayudar..."
+
+Chinese: "我需要帮助开始创业"
+→ Respond entirely in Chinese: "太好了！以下是一些可以帮助您的资源..."
+
+Tagalog: "Kailangan ko ng tulong sa pagsisimula ng negosyo"
+→ Respond entirely in Tagalog: "Maganda! Narito ang mga resources na makakatulong sa iyo..."
+
+Vietnamese: "Tôi cần giúp đỡ để bắt đầu kinh doanh"
+→ Respond entirely in Vietnamese: "Tuyệt vời! Đây là những nguồn lực có thể giúp bạn..."
 
 ## YOUR PERSONALITY
 - Friendly, encouraging, and supportive
-- Concise (this is Telegram - keep responses brief!)
+- Concise (this is Telegram - keep responses reasonably brief)
 - Practical and action-oriented
-- Knowledgeable about the startup journey
+- Culturally aware and respectful
 
 ## HOW TO RESPOND
 
 1. **When search results are provided:**
-   - Explain WHY each resource is relevant to their specific situation
+   - Explain WHY each resource is relevant to their situation (in their language)
    - Highlight the most important 2-3 resources
    - Include key details: cost (free/paid), what they offer
    - Suggest how to reach out if intro_script is available
-   - Ask a follow-up question to help narrow down or expand the search
+   - Ask a follow-up question in their language
 
 2. **When NO search results are provided:**
-   - Ask clarifying questions to understand their needs
+   - Ask clarifying questions (in their language)
    - Try to understand: their stage, what help they need, any relevant background
 
 3. **For follow-up questions:**
    - Remember context from the conversation
-   - Offer to search for different resources if needed
-   - Provide practical next steps
+   - Continue in the same language they've been using
 
 ## FORMATTING FOR TELEGRAM
 - Use *bold* for resource names and key points
-- Use _italics_ for categories or emphasis
+- Use _italics_ for emphasis
 - Keep paragraphs short (2-3 sentences max)
-- Use emojis sparingly but effectively: 🚀 💡 ✅ 🔗 💰 🆓
-- Don't use markdown headers (##) - they don't render in Telegram
+- Use emojis appropriately: 🚀 💡 ✅ 🔗 💰 🆓
+- Don't use markdown headers (##)
 
-## EXAMPLE RESPONSE STYLE
+## SPECIAL PHRASES BY LANGUAGE
 
-"Based on what you shared, here are my top picks:
-
-*1. Nevada SBDC* 🆓
-Perfect for early-stage founders who need help with business planning. They offer free one-on-one advising.
-
-*2. StartUpNV* 
-If you're building a scalable tech company, their accelerator could be a great fit.
-
-When reaching out to SBDC, try: _"I'm starting a business and would like help creating a business plan."_
-
-Would you like more details on either of these, or should I look for something more specific like funding or workspace?"
+Free = Gratis (ES) = 免费 (ZH) = Libre (TL) = Miễn phí (VI) = 무료 (KO) = 無料 (JA)
+Paid = De pago (ES) = 付费 (ZH) = Bayad (TL) = Trả phí (VI) = 유료 (KO) = 有料 (JA)
+Website = Sitio web (ES) = 网站 (ZH) = Website (TL) = Trang web (VI) = 웹사이트 (KO) = ウェブサイト (JA)
 """
+
+# ============================================================================
+# WELCOME MESSAGES BY LANGUAGE
+# ============================================================================
+
+WELCOME_MESSAGES = {
+    "en": """👋 Hi {name}! I'm the *Reno Startup Ecosystem Navigator*.
+
+I help founders find resources in the Reno-Tahoe region. I speak multiple languages - just write to me in yours!
+
+Tell me about yourself and what you're looking for. For example:
+• _"I'm a veteran looking to start a small business"_
+• _"I need funding for my tech startup"_
+• _"Where can I find free mentorship?"_
+
+What can I help you with today? 🚀""",
+
+    "es": """👋 ¡Hola {name}! Soy el *Navegador del Ecosistema Startup de Reno*.
+
+Ayudo a emprendedores a encontrar recursos en la región de Reno-Tahoe. ¡Hablo varios idiomas!
+
+Cuéntame sobre ti y qué estás buscando. Por ejemplo:
+• _"Soy veterano y quiero empezar un negocio"_
+• _"Necesito financiamiento para mi startup"_
+• _"¿Dónde puedo encontrar mentoría gratuita?"_
+
+¿En qué puedo ayudarte hoy? 🚀""",
+
+    "zh": """👋 你好 {name}！我是 *雷诺创业生态系统导航员*。
+
+我帮助创业者在雷诺-太浩地区找到资源。我会说多种语言！
+
+告诉我你的情况和需求。例如：
+• _"我是退伍军人，想创业"_
+• _"我需要为我的科技创业公司融资"_
+• _"哪里可以找到免费的导师指导？"_
+
+今天我能帮你什么？🚀""",
+
+    "tl": """👋 Kumusta {name}! Ako ang *Reno Startup Ecosystem Navigator*.
+
+Tinutulungan ko ang mga founder na makahanap ng resources sa Reno-Tahoe region. Nagsasalita ako ng maraming wika!
+
+Sabihin mo sa akin ang tungkol sa iyo at kung ano ang hinahanap mo. Halimbawa:
+• _"Veteran ako at gusto kong magsimula ng negosyo"_
+• _"Kailangan ko ng funding para sa aking startup"_
+• _"Saan ako makakahanap ng libreng mentorship?"_
+
+Paano kita matutulungan ngayon? 🚀""",
+
+    "vi": """👋 Xin chào {name}! Tôi là *Người hướng dẫn Hệ sinh thái Khởi nghiệp Reno*.
+
+Tôi giúp các nhà sáng lập tìm kiếm nguồn lực ở khu vực Reno-Tahoe. Tôi nói được nhiều ngôn ngữ!
+
+Hãy cho tôi biết về bạn và bạn đang tìm kiếm gì. Ví dụ:
+• _"Tôi là cựu chiến binh muốn bắt đầu kinh doanh"_
+• _"Tôi cần vốn cho startup công nghệ"_
+• _"Tôi có thể tìm cố vấn miễn phí ở đâu?"_
+
+Hôm nay tôi có thể giúp gì cho bạn? 🚀"""
+}
 
 # ============================================================================
 # SEARCH FUNCTIONS
@@ -192,6 +288,44 @@ RESOURCE: {r['name']}
     return "\n---\n".join(formatted)
 
 # ============================================================================
+# LANGUAGE DETECTION (simple heuristic for welcome message)
+# ============================================================================
+
+def detect_language_simple(text: str) -> str:
+    """Simple language detection for initial greeting."""
+    text_lower = text.lower()
+    
+    # Spanish indicators
+    spanish_words = ['hola', 'necesito', 'ayuda', 'negocio', 'busco', 'quiero', 'soy', 'español']
+    if any(word in text_lower for word in spanish_words):
+        return "es"
+    
+    # Chinese characters
+    if any('\u4e00' <= char <= '\u9fff' for char in text):
+        return "zh"
+    
+    # Vietnamese indicators (with diacritics)
+    vietnamese_chars = ['ă', 'â', 'đ', 'ê', 'ô', 'ơ', 'ư', 'ạ', 'ả', 'ã', 'ầ', 'ẩ']
+    if any(char in text_lower for char in vietnamese_chars):
+        return "vi"
+    
+    # Tagalog indicators
+    tagalog_words = ['ako', 'ang', 'mga', 'ko', 'sa', 'ng', 'kailangan', 'gusto', 'negosyo']
+    if any(word in text_lower for word in tagalog_words):
+        return "tl"
+    
+    # Korean characters
+    if any('\uac00' <= char <= '\ud7af' for char in text):
+        return "ko"
+    
+    # Japanese characters (hiragana/katakana)
+    if any('\u3040' <= char <= '\u30ff' for char in text):
+        return "ja"
+    
+    # Default to English
+    return "en"
+
+# ============================================================================
 # CLAUDE CONVERSATION
 # ============================================================================
 
@@ -215,14 +349,24 @@ def clear_history(user_id: int):
     conversation_history[user_id] = []
 
 def should_search(message: str, history: list[dict]) -> tuple[bool, str]:
-    """Use Claude to determine if we should search and what query to use."""
+    """Determine if we should search and what query to use."""
     
-    # Quick heuristics first
+    # Search indicators in multiple languages
     search_indicators = [
+        # English
         "looking for", "need help", "find", "search", "recommend",
         "resources", "funding", "mentor", "accelerator", "workspace",
         "starting", "business", "startup", "entrepreneur", "founder",
-        "veteran", "student", "woman", "grant", "investor"
+        "veteran", "student", "woman", "grant", "investor",
+        # Spanish
+        "busco", "necesito", "encontrar", "ayuda", "negocio", "emprender",
+        "financiamiento", "mentor", "subvención", "veterano",
+        # Chinese
+        "寻找", "需要", "帮助", "创业", "资金", "导师", "启动",
+        # Vietnamese
+        "tìm", "cần", "giúp", "kinh doanh", "khởi nghiệp", "vốn",
+        # Tagalog
+        "kailangan", "hanap", "tulong", "negosyo", "puhunan"
     ]
     
     message_lower = message.lower()
@@ -231,12 +375,18 @@ def should_search(message: str, history: list[dict]) -> tuple[bool, str]:
     if any(indicator in message_lower for indicator in search_indicators):
         return True, message
     
-    # If it's a short follow-up like "yes", "tell me more", etc.
-    short_responses = ["yes", "yeah", "sure", "ok", "okay", "tell me more", "more", "details"]
+    # Short follow-ups in multiple languages
+    short_responses = [
+        "yes", "yeah", "sure", "ok", "okay", "tell me more", "more", "details",
+        "sí", "si", "más", "detalles", "claro",
+        "是", "好", "更多", "详细",
+        "oo", "pa", "dagdag",
+        "vâng", "có", "thêm"
+    ]
     if message_lower.strip() in short_responses:
         return False, ""
     
-    # For ambiguous cases, let Claude decide
+    # For ambiguous cases, default to search
     return True, message
 
 async def get_claude_response(user_id: int, user_message: str, search_results: str = None) -> str:
@@ -251,11 +401,12 @@ async def get_claude_response(user_id: int, user_message: str, search_results: s
 SEARCH RESULTS FROM DATABASE:
 {search_results}
 
-Please analyze these results and provide a helpful, personalized response. Explain why these resources are relevant to their situation."""
+IMPORTANT: Respond in the SAME LANGUAGE as the user's message. Analyze these results and provide a helpful, personalized response in their language."""
     elif search_results == "NO RESULTS FOUND":
         augmented_message = f"""USER MESSAGE: {user_message}
 
-No resources were found matching this query. Please ask clarifying questions to better understand what they need, or suggest they try different search terms."""
+No resources were found matching this query. 
+IMPORTANT: Respond in the SAME LANGUAGE as the user's message. Ask clarifying questions in their language to better understand what they need."""
     else:
         augmented_message = user_message
     
@@ -280,7 +431,7 @@ No resources were found matching this query. Please ask clarifying questions to 
         
     except Exception as e:
         logger.error(f"Claude API error: {e}")
-        return "I'm having trouble connecting right now. Please try again in a moment."
+        return "I'm having trouble connecting right now. Please try again in a moment. / Tengo problemas de conexión. Inténtalo de nuevo. / 连接出现问题，请稍后再试。"
 
 # ============================================================================
 # ACCESS CONTROL
@@ -307,18 +458,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Clear conversation history for fresh start
     clear_history(user.id)
     
-    welcome_text = f"""👋 Hi {user.first_name}! I'm the *Reno Startup Ecosystem Navigator*.
-
-I can help you find the right resources for your entrepreneurial journey in the Reno-Tahoe region.
-
-Just tell me about yourself and what you're looking for. For example:
-
-• _"I'm a veteran looking to start a small business"_
-• _"I need funding for my tech startup"_
-• _"Where can I find free mentorship?"_
-
-What can I help you with today? 🚀"""
-
+    # Try to detect language from Telegram's language_code
+    lang_code = user.language_code[:2] if user.language_code else "en"
+    
+    # Get welcome message in user's language, default to English
+    welcome_text = WELCOME_MESSAGES.get(lang_code, WELCOME_MESSAGES["en"])
+    welcome_text = welcome_text.format(name=user.first_name)
+    
     await update.message.reply_text(welcome_text, parse_mode='Markdown')
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -327,22 +473,19 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("⛔ Sorry, you're not authorized to use this bot.")
         return
     
-    help_text = """*How to use this bot:*
+    help_text = """*How to use this bot / Cómo usar / 如何使用:*
 
-Just chat naturally! Tell me:
-• What stage you're at (idea, early, growing)
-• What kind of help you need
-• Any relevant background (veteran, student, etc.)
+Just chat naturally in your language!
+¡Solo chatea naturalmente en tu idioma!
+用你的语言自然聊天！
 
-*Commands:*
-/start - Start fresh conversation
-/clear - Clear conversation history
+*Commands / Comandos / 命令:*
+/start - Start fresh / Empezar de nuevo / 重新开始
+/clear - Clear history / Borrar historial / 清除历史
+/lang - Change language / Cambiar idioma / 更改语言
 /help - Show this message
 
-*Tips:*
-• Be specific about what you need
-• Ask follow-up questions
-• I remember our conversation context!"""
+🌐 Supported: English, Español, 中文, Tiếng Việt, Tagalog, 한국어, 日本語, and more!"""
 
     await update.message.reply_text(help_text, parse_mode='Markdown')
 
@@ -353,7 +496,37 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     
     clear_history(update.effective_user.id)
-    await update.message.reply_text("🔄 Conversation cleared! What would you like to explore?")
+    await update.message.reply_text(
+        "🔄 Conversation cleared!\n"
+        "¡Conversación borrada!\n"
+        "对话已清除！\n\n"
+        "What would you like to explore? / ¿Qué te gustaría explorar? / 你想探索什么？"
+    )
+
+async def lang_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show language options."""
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text("⛔ Sorry, you're not authorized to use this bot.")
+        return
+    
+    lang_text = """🌐 *Supported Languages / Idiomas / 语言*
+
+Just write in your preferred language and I'll respond in the same language!
+
+• 🇺🇸 English - Just type in English
+• 🇪🇸 Español - Solo escribe en español  
+• 🇨🇳 中文 - 用中文输入即可
+• 🇻🇳 Tiếng Việt - Chỉ cần nhập tiếng Việt
+• 🇵🇭 Tagalog - Mag-type lang sa Tagalog
+• 🇰🇷 한국어 - 한국어로 입력하세요
+• 🇯🇵 日本語 - 日本語で入力してください
+• 🇫🇷 Français - Écrivez en français
+• 🇩🇪 Deutsch - Schreiben Sie auf Deutsch
+• 🇵🇹 Português - Escreva em português
+
+Try it! / ¡Pruébalo! / 试试看！"""
+
+    await update.message.reply_text(lang_text, parse_mode='Markdown')
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle regular text messages with Claude AI."""
@@ -415,7 +588,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except Exception as e:
         logger.error(f"Message handling error: {e}")
         await update.message.reply_text(
-            "Sorry, I encountered an error. Please try again or use /start to restart."
+            "Sorry, I encountered an error. Please try again or use /start to restart.\n"
+            "Lo siento, ocurrió un error. Intenta de nuevo o usa /start.\n"
+            "抱歉，出现错误。请重试或使用 /start。"
         )
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -431,6 +606,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if data.startswith("details_"):
         resource_id = int(data.replace("details_", ""))
         
+        # Get user's detected language from recent conversation
+        history = get_conversation_history(query.from_user.id)
+        user_lang = "en"
+        if history:
+            # Use last user message to detect language
+            for msg in reversed(history):
+                if msg["role"] == "user":
+                    user_lang = detect_language_simple(msg["content"])
+                    break
+        
         try:
             resource = get_resource_details(resource_id)
             
@@ -439,6 +624,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 cost = resource.get('cost_levels', {}).get('name', 'N/A') if resource.get('cost_levels') else 'N/A'
                 cost_emoji = {"Free": "🆓", "Paid": "💰", "Varies": "💲"}.get(cost, "")
                 
+                # Basic info (keep resource names in English as proper nouns)
                 text = f"""📍 *{resource['name']}* {cost_emoji}
 
 *Category:* {resource.get('categories', {}).get('name', 'N/A') if resource.get('categories') else 'N/A'}
@@ -457,7 +643,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 # Buttons
                 keyboard = []
                 if resource.get('website'):
-                    keyboard.append([InlineKeyboardButton("🌐 Visit Website", url=resource['website'])])
+                    keyboard.append([InlineKeyboardButton("🌐 Website", url=resource['website'])])
                 
                 reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
                 
@@ -499,7 +685,8 @@ def main() -> None:
         print(f"ERROR: Missing environment variables: {', '.join(missing)}")
         return
     
-    print("🤖 Starting Reno Ecosystem Telegram Bot (with Claude AI)...")
+    print("🤖 Starting Reno Ecosystem Telegram Bot (Multi-Language)...")
+    print(f"🌐 Supported languages: {', '.join(SUPPORTED_LANGUAGES.values())}")
     
     # Create application
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
@@ -508,6 +695,7 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("clear", clear_command))
+    application.add_handler(CommandHandler("lang", lang_command))
     application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
@@ -515,7 +703,7 @@ def main() -> None:
     application.add_error_handler(error_handler)
     
     # Start polling
-    print("✅ Bot is running with Claude AI! Press Ctrl+C to stop.")
+    print("✅ Bot is running! Press Ctrl+C to stop.")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
