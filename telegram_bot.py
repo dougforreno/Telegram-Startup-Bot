@@ -29,6 +29,8 @@ from supabase import create_client
 from openai import OpenAI
 from anthropic import Anthropic
 from dotenv import load_dotenv
+import re
+import requests
 
 load_dotenv()
 
@@ -53,6 +55,9 @@ anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # Conversation history storage (in production, use Redis or database)
 conversation_history = {}
+
+# Simple per-user subscription state for newsletter signup
+subscription_state = {}
 
 # Logging
 logging.basicConfig(
@@ -345,8 +350,9 @@ def add_to_history(user_id: int, role: str, content: str):
         conversation_history[user_id] = history[-10:]
 
 def clear_history(user_id: int):
-    """Clear conversation history for a user."""
+    """Clear conversation history for a user and reset transient state."""
     conversation_history[user_id] = []
+    subscription_state.pop(user_id, None)
 
 def should_search(message: str, history: list[dict]) -> tuple[bool, str]:
     """Determine if we should search and what query to use."""
@@ -401,12 +407,16 @@ async def get_claude_response(user_id: int, user_message: str, search_results: s
 SEARCH RESULTS FROM DATABASE:
 {search_results}
 
-IMPORTANT: Respond in the SAME LANGUAGE as the user's message. Analyze these results and provide a helpful, personalized response in their language."""
+IMPORTANT: Respond in the SAME LANGUAGE as the user's message. Analyze these results and provide a helpful, personalized response in their language.
+
+If it would reasonably help this user, you may also suggest they subscribe to the Techstars Startup Digest Reno-Tahoe newsletter for ongoing ecosystem updates. Do not assume they are subscribed; only suggest it as an option."""
     elif search_results == "NO RESULTS FOUND":
         augmented_message = f"""USER MESSAGE: {user_message}
 
 No resources were found matching this query. 
-IMPORTANT: Respond in the SAME LANGUAGE as the user's message. Ask clarifying questions in their language to better understand what they need."""
+IMPORTANT: Respond in the SAME LANGUAGE as the user's message. Ask clarifying questions in their language to better understand what they need.
+
+If it would reasonably help this user, you may also suggest they subscribe to the Techstars Startup Digest Reno-Tahoe newsletter for ongoing ecosystem updates. Do not assume they are subscribed; only suggest it as an option."""
     else:
         augmented_message = user_message
     
@@ -528,15 +538,73 @@ Try it! / ¡Pruébalo! / 试试看！"""
 
     await update.message.reply_text(lang_text, parse_mode='Markdown')
 
+def is_valid_email(text: str) -> bool:
+    """Basic email validation for subscription flow."""
+    if not text or "@" not in text:
+        return False
+    # Very light regex; we don't need to be perfect.
+    return re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", text.strip()) is not None
+
+
+def subscribe_to_digest(email: str) -> bool:
+    """Subscribe a user to the Techstars Reno-Tahoe Startup Digest.
+
+    This uses a configurable endpoint via the STARTUP_DIGEST_SUBSCRIBE_URL env var.
+    If that URL is not set, we log and return False so the bot can tell the user
+    it couldn't auto-subscribe.
+    """
+    url = os.getenv("STARTUP_DIGEST_SUBSCRIBE_URL")
+    if not url:
+        logger.warning("STARTUP_DIGEST_SUBSCRIBE_URL is not set; cannot auto-subscribe %s", email)
+        return False
+
+    try:
+        # Many newsletter providers accept a simple form POST with at least an email field.
+        # Additional fields can be wired up later if needed.
+        resp = requests.post(url, data={"email": email}, timeout=10)
+        if resp.status_code in (200, 201, 302):
+            return True
+        logger.warning("Digest subscribe failed for %s: status %s", email, resp.status_code)
+        return False
+    except Exception as e:
+        logger.error("Digest subscribe exception for %s: %s", email, e)
+        return False
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle regular text messages with Claude AI."""
+    """Handle regular text messages with Claude AI + optional digest signup."""
     user = update.effective_user
     
     if not is_authorized(user.id):
         await update.message.reply_text("⛔ Sorry, you're not authorized to use this bot.")
         return
     
-    user_message = update.message.text
+    user_message = update.message.text.strip()
+
+    # Check if we're in the middle of the newsletter signup flow
+    state = subscription_state.get(user.id)
+    if state and state.get("awaiting_email"):
+        # Treat this message as an email address
+        email = user_message
+        if not is_valid_email(email):
+            await update.message.reply_text(
+                "That doesn't look like a valid email address. Please send a single email (e.g., name@example.com)."
+            )
+            return
+
+        # Try to subscribe
+        ok = subscribe_to_digest(email)
+        if ok:
+            await update.message.reply_text(
+                "✅ You're all set! I've submitted your email to the Techstars Startup Digest Reno-Tahoe list."
+            )
+        else:
+            await update.message.reply_text(
+                "I wasn't able to auto-subscribe you just now (newsletter endpoint isn't fully wired up). "
+                "You can also sign up manually at https://read.letterhead.email/techstars-reno-tahoe."
+            )
+        subscription_state.pop(user.id, None)
+        return
     
     # Show typing indicator
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
@@ -568,6 +636,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         
         # Get Claude's response
         response = await get_claude_response(user.id, user_message, search_results)
+
+        # Heuristic: if user explicitly asks to subscribe, start signup flow
+        if re.search(r"\bsubscribe\b|\bnewsletter\b|\bsign me up\b", user_message, re.I):
+            subscription_state[user.id] = {"awaiting_email": True}
+            response += "\n\nIf you'd like to get the Techstars Startup Digest Reno-Tahoe by email, reply with your email address (e.g., name@example.com)."
         
         # Send response with optional resource buttons
         if resource_buttons:
