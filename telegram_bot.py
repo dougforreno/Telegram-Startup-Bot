@@ -59,6 +59,11 @@ conversation_history = {}
 # Simple per-user subscription state for newsletter signup
 subscription_state = {}
 
+# Per-user mode: "ai" (default) vs "quick" (no LLM, just semantic DB search)
+MODE_AI = "ai"
+MODE_QUICK = "quick"
+user_modes: dict[int, str] = {}
+
 # Logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -292,6 +297,26 @@ RESOURCE: {r['name']}
     
     return "\n---\n".join(formatted)
 
+
+def format_resources_for_quick(results: list[dict]) -> str:
+    """Format search results for direct display in quick-search mode."""
+    lines: list[str] = []
+    for r in results:
+        tags = get_resource_tags(r["id"])
+        services = ", ".join(tags["services"]) if tags["services"] else "N/A"
+        audiences = ", ".join(tags["audiences"]) if tags["audiences"] else "N/A"
+        desc = r.get("description") or "No description available."
+        if len(desc) > 260:
+            desc = desc[:257] + "..."
+        lines.append(
+            f"*{r['name']}*\n"
+            f"Category: {r.get('category', 'N/A')}  |  Stage: {r.get('stage', 'N/A')}  |  Cost: {r.get('cost', 'N/A')}\n"
+            f"Services: {services}\n"
+            f"Audiences: {audiences}\n"
+            f"{desc}\n"
+        )
+    return "\n".join(lines)
+
 # ============================================================================
 # LANGUAGE DETECTION (simple heuristic for welcome message)
 # ============================================================================
@@ -340,6 +365,11 @@ def get_conversation_history(user_id: int) -> list[dict]:
         conversation_history[user_id] = []
     return conversation_history[user_id]
 
+
+def get_user_mode(user_id: int) -> str:
+    """Return the current mode for a user (AI or quick search)."""
+    return user_modes.get(user_id, MODE_AI)
+
 def add_to_history(user_id: int, role: str, content: str):
     """Add message to conversation history."""
     history = get_conversation_history(user_id)
@@ -353,6 +383,7 @@ def clear_history(user_id: int):
     """Clear conversation history for a user and reset transient state."""
     conversation_history[user_id] = []
     subscription_state.pop(user_id, None)
+
 
 def should_search(message: str, history: list[dict]) -> tuple[bool, str]:
     """Determine if we should search and what query to use."""
@@ -465,8 +496,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("⛔ Sorry, you're not authorized to use this bot.")
         return
     
-    # Clear conversation history for fresh start
+    # Clear conversation history for fresh start and default to AI mode
     clear_history(user.id)
+    user_modes[user.id] = MODE_AI
     
     # Try to detect language from Telegram's language_code
     lang_code = user.language_code[:2] if user.language_code else "en"
@@ -474,8 +506,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Get welcome message in user's language, default to English
     welcome_text = WELCOME_MESSAGES.get(lang_code, WELCOME_MESSAGES["en"])
     welcome_text = welcome_text.format(name=user.first_name)
+
+    commands_summary = (
+        "\n\n*Available commands*:\n"
+        "/events – Startup events in Reno\n"
+        "/mentorship – Mentorship resources\n"
+        "/funding – Funding and investment\n"
+        "/networking – Networking & community\n"
+        "/coworking – Coworking spaces\n"
+        "/ai_mode – Conversational AI assistant (default)\n"
+        "/quicksearch – Fast database-only search (no AI)\n"
+    )
     
-    await update.message.reply_text(welcome_text, parse_mode='Markdown')
+    await update.message.reply_text(welcome_text + commands_summary, parse_mode='Markdown')
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send help message."""
@@ -483,16 +526,28 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("⛔ Sorry, you're not authorized to use this bot.")
         return
     
-    help_text = """*How to use this bot / Cómo usar / 如何使用:*
+    mode = get_user_mode(update.effective_user.id)
+    mode_label = "AI assistant" if mode == MODE_AI else "Quick search"
+
+    help_text = f"""*How to use this bot / Cómo usar / 如何使用:*
 
 Just chat naturally in your language!
 ¡Solo chatea naturalmente en tu idioma!
 用你的语言自然聊天！
 
+*Modes:*
+/ai_mode – Conversational AI that explains results and asks follow-ups (current: {mode_label})
+/quicksearch – Fast semantic search that just shows matching resources (no AI)
+
 *Commands / Comandos / 命令:*
 /start - Start fresh / Empezar de nuevo / 重新开始
 /clear - Clear history / Borrar historial / 清除历史
 /lang - Change language / Cambiar idioma / 更改语言
+/events - Startup events in Reno
+/mentorship - Mentorship resources
+/funding - Funding and investment resources
+/networking - Networking & community
+/coworking - Coworking spaces
 /help - Show this message
 
 🌐 Supported: English, Español, 中文, Tiếng Việt, Tagalog, 한국어, 日本語, and more!"""
@@ -529,7 +584,7 @@ Just write in your preferred language and I'll respond in the same language!
 • 🇻🇳 Tiếng Việt - Chỉ cần nhập tiếng Việt
 • 🇵🇭 Tagalog - Mag-type lang sa Tagalog
 • 🇰🇷 한국어 - 한국어로 입력하세요
-• 🇯🇵 日本語 - 日本語で入力してください
+• 🇯🇵 日本語 - 日本語で输入してください
 • 🇫🇷 Français - Écrivez en français
 • 🇩🇪 Deutsch - Schreiben Sie auf Deutsch
 • 🇵🇹 Português - Escreva em português
@@ -544,6 +599,32 @@ def is_valid_email(text: str) -> bool:
         return False
     # Very light regex; we don't need to be perfect.
     return re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", text.strip()) is not None
+
+
+async def ai_mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Switch the current chat to full AI-assistant mode."""
+    user = update.effective_user
+    if not is_authorized(user.id):
+        await update.message.reply_text("⛔ Sorry, you're not authorized to use this bot.")
+        return
+    user_modes[user.id] = MODE_AI
+    await update.message.reply_text(
+        "🤖 Switched to *AI mode*: I'll use the LLM to interpret search results, explain options, and ask smart follow-up questions.",
+        parse_mode='Markdown',
+    )
+
+
+async def quicksearch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Switch the current chat to quick-search mode (no LLM)."""
+    user = update.effective_user
+    if not is_authorized(user.id):
+        await update.message.reply_text("⛔ Sorry, you're not authorized to use this bot.")
+        return
+    user_modes[user.id] = MODE_QUICK
+    await update.message.reply_text(
+        "⚡ Switched to *quick search* mode: I'll return matching resources directly from the database without AI commentary.",
+        parse_mode='Markdown',
+    )
 
 
 def subscribe_to_digest(email: str, kind: str) -> bool:
@@ -587,6 +668,7 @@ async def handle_message_core(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     
     user_message = user_message.strip()
+    mode = get_user_mode(user.id)
 
     # Check if we're in the middle of the newsletter signup flow
     state = subscription_state.get(user.id)
@@ -652,10 +734,38 @@ async def handle_message_core(update: Update, context: ContextTypes.DEFAULT_TYPE
         if should_do_search:
             # Search the database
             results = search_resources(search_query, limit=5)
-            
+
+            if mode == MODE_QUICK:
+                # Quick search: show results directly without LLM
+                if results:
+                    text = "🔎 Quick search results (database only):\n\n" + format_resources_for_quick(results)
+
+                    # Create buttons for top results
+                    for r in results[:3]:  # Top 3 as buttons
+                        resource_buttons.append([
+                            InlineKeyboardButton(
+                                f"📋 {r['name'][:35]}{'...' if len(r['name']) > 35 else ''}",
+                                callback_data=f"details_{r['id']}"
+                            )
+                        ])
+
+                    reply_markup = InlineKeyboardMarkup(resource_buttons) if resource_buttons else None
+                    await update.message.reply_text(
+                        text,
+                        parse_mode='Markdown',
+                        reply_markup=reply_markup,
+                        disable_web_page_preview=True,
+                    )
+                else:
+                    await update.message.reply_text(
+                        "I couldn't find any resources matching that. Try being a bit more specific (for example, 'funding for hardware startups in Reno')."
+                    )
+                return
+
+            # AI mode: use results as context for Claude
             if results:
                 search_results = format_resources_for_claude(results)
-                
+
                 # Create buttons for top results
                 for r in results[:3]:  # Top 3 as buttons
                     resource_buttons.append([
@@ -666,8 +776,8 @@ async def handle_message_core(update: Update, context: ContextTypes.DEFAULT_TYPE
                     ])
             else:
                 search_results = "NO RESULTS FOUND"
-        
-        # Get Claude's response
+
+        # Get Claude's response (AI mode)
         response = await get_claude_response(user.id, user_message, search_results)
 
         # Heuristic: if user explicitly asks to subscribe, prompt for which newsletter
@@ -824,8 +934,10 @@ def main() -> None:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("clear", clear_command))
     application.add_handler(CommandHandler("lang", lang_command))
+    application.add_handler(CommandHandler("ai_mode", ai_mode_command))
+    application.add_handler(CommandHandler("quicksearch", quicksearch_command))
 
-    # Resource-type shortcuts
+    # Resource-type shortcuts (these respect the current mode under the hood)
     application.add_handler(CommandHandler("events", lambda u, c: handle_message_with_seed(u, c, "events and startup events in Reno")))
     application.add_handler(CommandHandler("mentorship", lambda u, c: handle_message_with_seed(u, c, "mentorship resources for founders in Reno")))
     application.add_handler(CommandHandler("funding", lambda u, c: handle_message_with_seed(u, c, "funding and investment resources for Reno startups")))
