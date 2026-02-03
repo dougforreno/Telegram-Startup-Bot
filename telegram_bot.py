@@ -578,15 +578,15 @@ def subscribe_to_digest(email: str, kind: str) -> bool:
         return False
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle regular text messages with Claude AI + optional digest signup."""
+async def handle_message_core(update: Update, context: ContextTypes.DEFAULT_TYPE, user_message: str) -> None:
+    """Core handler logic shared by normal messages and slash commands."""
     user = update.effective_user
     
     if not is_authorized(user.id):
         await update.message.reply_text("⛔ Sorry, you're not authorized to use this bot.")
         return
     
-    user_message = update.message.text.strip()
+    user_message = user_message.strip()
 
     # Check if we're in the middle of the newsletter signup flow
     state = subscription_state.get(user.id)
@@ -705,17 +705,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "抱歉，出现错误。请重试或使用 /start。"
         )
 
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle regular text messages with Claude AI + optional digest signup."""
+    if update.message is None or update.message.text is None:
+        return
+    await handle_message_core(update, context, update.message.text)
+
+
 async def handle_message_with_seed(update: Update, context: ContextTypes.DEFAULT_TYPE, seed_query: str) -> None:
     """Entry point for /events, /mentorship, /funding, etc.
 
-    We reuse handle_message by pretending the user sent a seed query, so Claude
-    + the search pipeline can do their normal work. This keeps behavior
-    consistent while giving users quick slash commands for common needs.
+    We reuse the same core handler, but feed it a canned query instead of the
+    literal slash command text.
     """
-    # Create a fake message object with the seed query but preserve user/chat
-    if update.message is not None:
-        update.message.text = seed_query
-    await handle_message(update, context)
+    await handle_message_core(update, context, seed_query)
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
