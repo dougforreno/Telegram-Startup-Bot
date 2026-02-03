@@ -546,16 +546,23 @@ def is_valid_email(text: str) -> bool:
     return re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", text.strip()) is not None
 
 
-def subscribe_to_digest(email: str) -> bool:
-    """Subscribe a user to the Techstars Reno-Tahoe Startup Digest.
+def subscribe_to_digest(email: str, kind: str) -> bool:
+    """Subscribe a user to one of the Reno newsletters.
 
-    This uses a configurable endpoint via the STARTUP_DIGEST_SUBSCRIBE_URL env var.
-    If that URL is not set, we log and return False so the bot can tell the user
-    it couldn't auto-subscribe.
+    kind:
+      - "SD"  -> Techstars Startup Digest Reno-Tahoe
+      - "RSW" -> Reno Startup Week / Startup Reno newsletter
     """
-    url = os.getenv("STARTUP_DIGEST_SUBSCRIBE_URL")
+    if kind == "SD":
+        url = os.getenv("STARTUP_DIGEST_SUBSCRIBE_URL")
+    elif kind == "RSW":
+        url = os.getenv("STARTUP_RENO_SUBSCRIBE_URL")
+    else:
+        logger.warning("Unknown subscription kind %s for %s", kind, email)
+        return False
+
     if not url:
-        logger.warning("STARTUP_DIGEST_SUBSCRIBE_URL is not set; cannot auto-subscribe %s", email)
+        logger.warning("Subscribe URL not set for kind %s; cannot auto-subscribe %s", kind, email)
         return False
 
     try:
@@ -564,10 +571,10 @@ def subscribe_to_digest(email: str) -> bool:
         resp = requests.post(url, data={"email": email}, timeout=10)
         if resp.status_code in (200, 201, 302):
             return True
-        logger.warning("Digest subscribe failed for %s: status %s", email, resp.status_code)
+        logger.warning("Subscribe failed for %s (%s): status %s", email, kind, resp.status_code)
         return False
     except Exception as e:
-        logger.error("Digest subscribe exception for %s: %s", email, e)
+        logger.error("Subscribe exception for %s (%s): %s", email, kind, e)
         return False
 
 
@@ -583,6 +590,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # Check if we're in the middle of the newsletter signup flow
     state = subscription_state.get(user.id)
+
+    # First, handle a pending newsletter choice (which list)
+    if state and state.get("awaiting_choice"):
+        choice = user_message.upper()
+        if choice not in ("SD", "RSW"):
+            await update.message.reply_text(
+                "Please reply with *SD* for Techstars Startup Digest Reno-Tahoe or *RSW* for the Reno Startup Week newsletter.",
+            )
+            return
+        # Store choice and move to email collection
+        subscription_state[user.id] = {"awaiting_email": True, "kind": choice}
+        if choice == "SD":
+            prompt = "Great — I’ll subscribe you to Techstars Startup Digest Reno-Tahoe. Please send your email address (e.g., name@example.com)."
+        else:
+            prompt = "Great — I’ll subscribe you to the Reno Startup Week / Startup Reno newsletter. Please send your email address (e.g., name@example.com)."
+        await update.message.reply_text(prompt)
+        return
+
+    # Then, handle a pending email capture for a chosen list
     if state and state.get("awaiting_email"):
         # Treat this message as an email address
         email = user_message
@@ -592,16 +618,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             return
 
+        kind = state.get("kind", "SD")  # default to Startup Digest
+
         # Try to subscribe
-        ok = subscribe_to_digest(email)
+        ok = subscribe_to_digest(email, kind)
         if ok:
-            await update.message.reply_text(
-                "✅ You're all set! I've submitted your email to the Techstars Startup Digest Reno-Tahoe list."
-            )
+            if kind == "SD":
+                msg = "✅ You're all set! I've submitted your email to the Techstars Startup Digest Reno-Tahoe list."
+            else:
+                msg = "✅ You're all set! I've submitted your email to the Reno Startup Week / Startup Reno newsletter."
+            await update.message.reply_text(msg)
         else:
+            if kind == "SD":
+                fallback = "You can also sign up manually at https://read.letterhead.email/techstars-reno-tahoe."
+            else:
+                fallback = "You can also sign up manually at https://www.renostartupweek.com."
             await update.message.reply_text(
-                "I wasn't able to auto-subscribe you just now (newsletter endpoint isn't fully wired up). "
-                "You can also sign up manually at https://read.letterhead.email/techstars-reno-tahoe."
+                "I wasn't able to auto-subscribe you just now (newsletter endpoint isn't fully wired up). " + fallback
             )
         subscription_state.pop(user.id, None)
         return
@@ -637,10 +670,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         # Get Claude's response
         response = await get_claude_response(user.id, user_message, search_results)
 
-        # Heuristic: if user explicitly asks to subscribe, start signup flow
+        # Heuristic: if user explicitly asks to subscribe, prompt for which newsletter
         if re.search(r"\bsubscribe\b|\bnewsletter\b|\bsign me up\b", user_message, re.I):
-            subscription_state[user.id] = {"awaiting_email": True}
-            response += "\n\nIf you'd like to get the Techstars Startup Digest Reno-Tahoe by email, reply with your email address (e.g., name@example.com)."
+            # Ask which list they want: SD (Startup Digest) or RSW (Reno Startup Week)
+            subscription_state[user.id] = {"awaiting_choice": True}
+            response += (
+                "\n\nYou can subscribe to: \n"
+                "- *SD* – Techstars Startup Digest Reno-Tahoe\n"
+                "- *RSW* – Reno Startup Week / Startup Reno newsletter\n\n"
+                "Reply with *SD* or *RSW* to choose."
+            )
         
         # Send response with optional resource buttons
         if resource_buttons:
