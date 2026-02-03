@@ -705,6 +705,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "抱歉，出现错误。请重试或使用 /start。"
         )
 
+async def handle_message_with_seed(update: Update, context: ContextTypes.DEFAULT_TYPE, seed_query: str) -> None:
+    """Entry point for /events, /mentorship, /funding, etc.
+
+    We reuse handle_message by pretending the user sent a seed query, so Claude
+    + the search pipeline can do their normal work. This keeps behavior
+    consistent while giving users quick slash commands for common needs.
+    """
+    # Create a fake message object with the seed query but preserve user/chat
+    if update.message is not None:
+        update.message.text = seed_query
+    await handle_message(update, context)
+
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle inline button callbacks for resource details."""
     query = update.callback_query
@@ -808,6 +821,14 @@ def main() -> None:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("clear", clear_command))
     application.add_handler(CommandHandler("lang", lang_command))
+
+    # Resource-type shortcuts
+    application.add_handler(CommandHandler("events", lambda u, c: handle_message_with_seed(u, c, "events and startup events in Reno")))
+    application.add_handler(CommandHandler("mentorship", lambda u, c: handle_message_with_seed(u, c, "mentorship resources for founders in Reno")))
+    application.add_handler(CommandHandler("funding", lambda u, c: handle_message_with_seed(u, c, "funding and investment resources for Reno startups")))
+    application.add_handler(CommandHandler("networking", lambda u, c: handle_message_with_seed(u, c, "networking and community events for founders in Reno")))
+    application.add_handler(CommandHandler("coworking", lambda u, c: handle_message_with_seed(u, c, "coworking spaces and shared offices in Reno")))
+
     application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
